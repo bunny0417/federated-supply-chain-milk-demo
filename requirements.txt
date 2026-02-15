@@ -1,0 +1,8 @@
+torch
+transformers
+accelerate
+bitsandbytes
+pandas
+numpy
+streamlit
+matplotlib
