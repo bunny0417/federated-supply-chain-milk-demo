@@ -28,7 +28,7 @@ How the system works:
 
 2.  **Run the Simulation**:
     ```bash
-    streamlit run app.py hacked !!!!!
+    streamlit run app.py
     ```
 
 ## Project Structure
