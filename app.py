@@ -10,11 +10,17 @@ import time
 from main import (
     load_model, 
     SCConfig, 
+    POPULAR_CURRENCY_CODES,
+    CURRENCY_NAMES,
+    CURRENCY_SYMBOLS,
+    build_round_context,
+    build_insight_messages,
+    build_chat_messages,
+    generate_grounded_response,
     SupplyChainDataManager, 
     FedSim,
     LSTMModel, 
     optimize, 
-    llm_generate, 
     to_serializable,
     get_device
 )
@@ -41,7 +47,7 @@ st.markdown("""
 
 import matplotlib.pyplot as plt
 
-def plot_financial_pie(financials):
+def plot_financial_pie(financials, currency_code):
     labels = ['Projected Revenue', 'Order Cost', 'Potential Waste Cost']
     # Pie chart values: Revenue is positive, Costs are negative expenses but we plot magnitude
     # Actually, a better breakdown for parts-to-whole is: Profit + Cost + Waste = Total Revenue (if we sell all)
@@ -61,11 +67,51 @@ def plot_financial_pie(financials):
     ax.pie(sizes, explode=explode, labels=labels, colors=colors, autopct='%1.1f%%',
            shadow=True, startangle=90)
     ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+    ax.set_title(f"Financial Mix ({currency_code})")
     return fig
+
+
+def format_currency(amount, currency_code):
+    symbol = CURRENCY_SYMBOLS.get(currency_code, currency_code)
+    return f"{symbol}{amount:.2f} {currency_code}"
+
+
+def pick_directory(title, initial_dir):
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        chosen = filedialog.askdirectory(title=title, initialdir=initial_dir or os.getcwd())
+        root.destroy()
+
+        if chosen:
+            return os.path.normpath(chosen)
+    except Exception as e:
+        st.sidebar.warning(f"Folder picker unavailable. Enter path manually. ({e})")
+    return None
 
 # Title
 st.title("🤖 Federated Supply Chain Optimization")
 st.markdown(f"**Device:** `{get_device()}` | **Model:** `{SCConfig.MODEL_NAME}`")
+
+# Initialize sidebar-related session state before creating sidebar widgets
+if "dataset_dir_text" not in st.session_state:
+    st.session_state.dataset_dir_text = SCConfig.DATASET_DIR
+if "log_dir_text" not in st.session_state:
+    st.session_state.log_dir_text = SCConfig.LOG_DIR
+if "manual_currency_code" not in st.session_state:
+    st.session_state.manual_currency_code = SCConfig.CURRENCY
+if "effective_currency" not in st.session_state:
+    st.session_state.effective_currency = SCConfig.CURRENCY
+if "currency_mode" not in st.session_state:
+    st.session_state.currency_mode = "manual"
+if "mixed_currency_warning" not in st.session_state:
+    st.session_state.mixed_currency_warning = False
+if "currency_detection_details" not in st.session_state:
+    st.session_state.currency_detection_details = {}
 
 # Sidebar - Configuration
 st.sidebar.header("Configuration")
@@ -74,15 +120,76 @@ num_clients = st.sidebar.slider("Number of Clients", 1, 10, SCConfig.NUM_CLIENTS
 num_rounds = st.sidebar.slider("Federated Rounds", 1, 10, SCConfig.NUM_ROUNDS)
 carbon_cap = st.sidebar.number_input("Carbon Cap", value=SCConfig.CARBON_CAP)
 dp_epsilon = st.sidebar.slider("DP Epsilon (Privacy Budget)", 0.1, 20.0, SCConfig.DP_EPSILON, help="Lower = More Noise/Privacy")
-log_dir = st.sidebar.text_input("Log Directory", SCConfig.LOG_DIR)
+explanation_max_tokens = st.sidebar.slider("Explanation Max Tokens", 60, 260, 120, step=20)
+data_source_mode = st.sidebar.selectbox("Data Source", ["real", "synthetic"], index=0 if SCConfig.DATA_SOURCE_MODE == "real" else 1)
+manual_currency_index = 0
+if st.session_state.manual_currency_code in POPULAR_CURRENCY_CODES:
+    manual_currency_index = POPULAR_CURRENCY_CODES.index(st.session_state.manual_currency_code)
+
+manual_currency = st.sidebar.selectbox(
+    "Manual Currency (Fallback)",
+    POPULAR_CURRENCY_CODES,
+    index=manual_currency_index,
+    key="manual_currency_code",
+    format_func=lambda code: f"{code} - {CURRENCY_NAMES.get(code, code)} ({CURRENCY_SYMBOLS.get(code, code)})"
+)
+
+st.sidebar.text_input("Dataset Directory", key="dataset_dir_text")
+if st.sidebar.button("Browse Dataset Directory"):
+    selected = pick_directory("Select Dataset Directory", st.session_state.dataset_dir_text)
+    if selected:
+        st.session_state.dataset_dir_text = selected
+        st.rerun()
+
+st.sidebar.text_input("Log Directory", key="log_dir_text")
+if st.sidebar.button("Browse Log Directory"):
+    selected = pick_directory("Select Log Directory", st.session_state.log_dir_text)
+    if selected:
+        st.session_state.log_dir_text = selected
+        st.rerun()
 
 
 # Update Config
 SCConfig.NUM_CLIENTS = num_clients
 SCConfig.NUM_ROUNDS = num_rounds
 SCConfig.CARBON_CAP = carbon_cap
-SCConfig.LOG_DIR = log_dir
 SCConfig.DP_EPSILON = dp_epsilon
+SCConfig.DATA_SOURCE_MODE = data_source_mode
+SCConfig.CURRENCY = manual_currency
+
+dataset_dir = st.session_state.dataset_dir_text.strip()
+log_dir = st.session_state.log_dir_text.strip()
+SCConfig.DATASET_DIR = os.path.normpath(dataset_dir) if dataset_dir else ""
+SCConfig.LOG_DIR = os.path.normpath(log_dir) if log_dir else ""
+
+if st.session_state.currency_mode != "auto-detected":
+    st.session_state.effective_currency = SCConfig.CURRENCY
+
+effective_currency = st.session_state.get("effective_currency", SCConfig.CURRENCY)
+effective_symbol = CURRENCY_SYMBOLS.get(effective_currency, effective_currency)
+if st.session_state.currency_mode == "auto-detected":
+    st.sidebar.success(f"Currency in use: {effective_currency} ({effective_symbol}) [auto-detected]")
+else:
+    st.sidebar.info(f"Currency in use: {effective_currency} ({effective_symbol}) [manual fallback]")
+
+if st.session_state.mixed_currency_warning:
+    st.sidebar.warning("Mixed currencies detected across files. Using the first detected currency.")
+
+if st.session_state.currency_mode == "auto-detected" and st.session_state.currency_detection_details:
+    first_file = next(iter(st.session_state.currency_detection_details.keys()))
+    first_detail = st.session_state.currency_detection_details[first_file]
+    st.sidebar.caption(
+        f"Detection source: {first_file} -> {first_detail.get('currency')} ({first_detail.get('source')})"
+    )
+
+if SCConfig.DATA_SOURCE_MODE == "real" and SCConfig.DATASET_DIR and not os.path.isdir(SCConfig.DATASET_DIR):
+    st.sidebar.warning(f"Dataset directory not found: {SCConfig.DATASET_DIR}")
+
+if SCConfig.LOG_DIR:
+    try:
+        os.makedirs(SCConfig.LOG_DIR, exist_ok=True)
+    except OSError as e:
+        st.sidebar.error(f"Log directory is not writable: {e}")
 
 # Initialize Session State
 if "model" not in st.session_state:
@@ -99,6 +206,12 @@ if "metrics" not in st.session_state:
     st.session_state.metrics = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "data_manager" not in st.session_state:
+    st.session_state.data_manager = None
+if "client0_max" not in st.session_state:
+    st.session_state.client0_max = None
+if "round_context" not in st.session_state:
+    st.session_state.round_context = None
 
 # Main Layout: 2 Columns
 # split into [Left: Simulation/Results, Right: Chat Assistant]
@@ -142,8 +255,18 @@ with main_col:
             status_text = st.empty()
             
             # 1. Initialize Data (Only if not already active? No, re-run means fresh data/round)
-            status_text.text("Generating synthetic data...")
-            data_manager = SupplyChainDataManager(SCConfig.NUM_CLIENTS)
+            status_text.text(f"Loading {SCConfig.DATA_SOURCE_MODE} client data...")
+            data_manager = SupplyChainDataManager(
+                SCConfig.NUM_CLIENTS,
+                data_mode=SCConfig.DATA_SOURCE_MODE,
+                dataset_dir=SCConfig.DATASET_DIR,
+                manual_currency=SCConfig.CURRENCY
+            )
+            st.session_state.data_manager = data_manager
+            st.session_state.effective_currency = data_manager.get_effective_currency()
+            st.session_state.currency_mode = "auto-detected" if data_manager.is_currency_auto_detected() else "manual"
+            st.session_state.mixed_currency_warning = data_manager.has_mixed_currency()
+            st.session_state.currency_detection_details = data_manager.currency_detection_details
             progress_bar.progress(20)
             
             # 2. Run FedSim
@@ -160,7 +283,8 @@ with main_col:
             
             # Prepare input for LSTM (Last 5 weeks)
             data = client0_df["demand"].values.astype(np.float32)
-            max_val = 300.0
+            max_val = fed.max_vals.get("0", float(np.max(data)) if np.max(data) > 0 else 1.0)
+            st.session_state.client0_max = max_val
             last_seq = data[-5:] / max_val
             inp = torch.tensor(last_seq).unsqueeze(0).unsqueeze(-1)
             
@@ -185,6 +309,13 @@ with main_col:
             st.session_state.opt_result = opt
             st.session_state.metrics = metrics
             st.session_state.simulation_done = True
+            st.session_state.round_context = build_round_context(
+                opt,
+                forecast,
+                st.session_state.effective_currency,
+                disruption_prob=float(client0["disruption_prob"]),
+                emission_factor=float(client0["emission_factor"]),
+            )
             
             # We DON'T clear messages on re-run so user keeps chat history across rounds
             # st.session_state.messages = [] 
@@ -200,10 +331,12 @@ with main_col:
     if st.session_state.simulation_done and st.session_state.opt_result:
         st.divider()
         st.header("Results & Recommendation")
+        data_manager = st.session_state.get("data_manager")
         
         opt = st.session_state.opt_result
         forecast = st.session_state.forecast
         metrics = st.session_state.metrics
+        effective_currency = st.session_state.get("effective_currency", SCConfig.CURRENCY)
         
         # Training Metrics
         st.subheader("Training Performance")
@@ -226,6 +359,20 @@ with main_col:
 
         # Historical Trend Visualization
         st.subheader("Historical Demand & Forecast")
+        if data_manager is None:
+            data_manager = SupplyChainDataManager(
+                SCConfig.NUM_CLIENTS,
+                data_mode=SCConfig.DATA_SOURCE_MODE,
+                dataset_dir=SCConfig.DATASET_DIR,
+                manual_currency=SCConfig.CURRENCY
+            )
+            st.session_state.data_manager = data_manager
+            st.session_state.effective_currency = data_manager.get_effective_currency()
+            st.session_state.currency_mode = "auto-detected" if data_manager.is_currency_auto_detected() else "manual"
+            st.session_state.mixed_currency_warning = data_manager.has_mixed_currency()
+            st.session_state.currency_detection_details = data_manager.currency_detection_details
+            effective_currency = st.session_state.get("effective_currency", SCConfig.CURRENCY)
+
         client0_df = data_manager.get_client_data("0")
         
         # Get last 20 weeks for better visibility (or full history)
@@ -239,7 +386,10 @@ with main_col:
         # We need to structure it for the chart
         # Let's use a simple line chart with the forecast appended
         
-        chart_data = history_df[["week", "demand"]].set_index("week")
+        if "date" in history_df.columns and history_df["date"].notna().any():
+            chart_data = history_df[["date", "demand"]].set_index("date")
+        else:
+            chart_data = history_df[["week", "demand"]].set_index("week")
         
         # Add Forecast row
         # We can't easily mix types in simple st.line_chart, so we plot history 
@@ -261,33 +411,39 @@ with main_col:
         
         f1, f2 = st.columns([1, 2])
         with f1:
-            st.metric("Proj. Revenue", f"${fin['revenue']:.2f}")
-            st.metric("Net Profit", f"${fin['net_profit']:.2f}", delta_color="normal")
+            st.metric("Proj. Revenue", format_currency(fin['revenue'], effective_currency))
+            st.metric("Net Profit", format_currency(fin['net_profit'], effective_currency), delta_color="normal")
         with f2:
-            st.write("Current round financial composition:")
-            st.pyplot(plot_financial_pie(fin))
+            st.write(f"Current round financial composition ({effective_currency}):")
+            st.pyplot(plot_financial_pie(fin, effective_currency))
 
         
         # LLM Recommendation
         st.subheader("AI Insight")
         if st.button("Generate Explanation"):
             with st.spinner("Asking TinyLlama..."):
-                system_msg = {
-                    "role": "system", 
-                    "content": f"You are a supply chain expert. Product: {SCConfig.PRODUCT_NAME}. Forecast: {forecast}. Emissions: {opt['emissions']:.2f}."
-                }
-                user_msg = {
-                    "role": "user", 
-                    "content": f"The recommended order quantity is {opt['optimized_qty']}. Provide a brief strategic recommendation."
-                }
-                
-                insight = llm_generate(
-                    [system_msg, user_msg],
+                latest_row = client0_df.iloc[-1]
+                insight_context = build_round_context(
+                    opt,
+                    forecast,
+                    effective_currency,
+                    disruption_prob=float(latest_row["disruption_prob"]),
+                    emission_factor=float(latest_row["emission_factor"]),
+                )
+                st.session_state.round_context = insight_context
+                insight_messages = build_insight_messages(insight_context)
+                insight_result = generate_grounded_response(
+                    insight_messages,
                     st.session_state.tokenizer,
                     st.session_state.model,
-                    max_tokens=150
+                    max_tokens=explanation_max_tokens,
+                    mode="insight",
+                    context=insight_context,
+                    retry_on_failure=False,
                 )
-                st.info(insight)
+                st.info(insight_result["text"])
+                if insight_result.get("used_fallback"):
+                    st.caption("Low-confidence model output detected. A deterministic tactical fallback was shown.")
                 
         # Manual Override
         st.divider()
@@ -338,33 +494,35 @@ with chat_col:
             with st.chat_message("user"):
                 st.markdown(prompt)
                 
-            # Construct Context from session state if available
-            context_str = ""
-            if st.session_state.simulation_done and st.session_state.opt_result:
-                opt = st.session_state.opt_result
-                forecast = st.session_state.forecast
-                context_str = (
-                    f"Context: Managing supply chain for '{SCConfig.PRODUCT_NAME}'. "
-                    f"Forecast: {forecast} units. "
-                    f"Recommended Order: {opt['optimized_qty']} units. "
-                    f"Emissions: {opt['emissions']:.2f}. "
-                )
-            
-            messages = [
-                {"role": "system", "content": f"You are a helpful Supply Chain Assistant. {context_str}"},
-                {"role": "user", "content": prompt}
-            ]
+            chat_context = st.session_state.get("round_context")
+            if chat_context is None and st.session_state.simulation_done and st.session_state.opt_result:
+                dm = st.session_state.get("data_manager")
+                if dm is not None:
+                    last_row = dm.get_client_data("0").iloc[-1]
+                    chat_context = build_round_context(
+                        st.session_state.opt_result,
+                        st.session_state.forecast,
+                        st.session_state.get("effective_currency", SCConfig.CURRENCY),
+                        disruption_prob=float(last_row["disruption_prob"]),
+                        emission_factor=float(last_row["emission_factor"]),
+                    )
+                    st.session_state.round_context = chat_context
+            messages = build_chat_messages(prompt, chat_context)
             
             # Generate Response
             if st.session_state.model:
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
-                        response = llm_generate(
-                            messages, 
+                        response_result = generate_grounded_response(
+                            messages,
                             st.session_state.tokenizer,
                             st.session_state.model,
-                            max_tokens=200
+                            max_tokens=220,
+                            mode="chat",
+                            context=chat_context,
+                            retry_on_failure=True,
                         )
+                        response = response_result["text"]
                         st.markdown(response)
                 
                 # Add assistant message
